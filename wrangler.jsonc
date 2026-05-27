@@ -1,0 +1,35 @@
+{
+  "name": "eving-r2-cleanup",
+  "main": "src/index.ts",
+  "workers_dev": true,
+  "preview_urls": false,
+  "compatibility_date": "2026-05-24",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": false,
+      "persist": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "eving-files"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "api.eving.app",
+      "zone_name": "eving.app",
+      "custom_domain": true
+    }
+  ]
+}
