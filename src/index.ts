@@ -111,20 +111,127 @@ function extractName(key: string): string {
 }
 
 /**
- * Считает общий объём storage пользователя суммируя все размеры в `drops/<userId>/`.
- * Хождение в R2 list — стоит копейки, но кэшировать стоило бы для high-traffic.
+ * Считает общий объём storage пользователя:
+ *   drops/<userId>/  (DROP files) + notes-images/<userId>/  (картинки в заметках).
+ * Учитывается в одну общую квоту FREE 1 GB.
  */
 async function calculateUsage(env: Env, userId: string): Promise<number> {
-  const prefix = `drops/${userId}/`;
+  const prefixes = [`drops/${userId}/`, `notes-images/${userId}/`];
   let total = 0;
-  let cursor: string | undefined;
-  // Пагинация на случай >1000 файлов
-  do {
-    const listing: R2Objects = await env.BUCKET.list({ prefix, limit: 1000, cursor });
-    for (const obj of listing.objects) total += obj.size;
-    cursor = listing.truncated ? listing.cursor : undefined;
-  } while (cursor);
+  for (const prefix of prefixes) {
+    let cursor: string | undefined;
+    do {
+      const listing: R2Objects = await env.BUCKET.list({ prefix, limit: 1000, cursor });
+      for (const obj of listing.objects) total += obj.size;
+      cursor = listing.truncated ? listing.cursor : undefined;
+    } while (cursor);
+  }
   return total;
+}
+
+/**
+ * POST /presign-image — presigned PUT URL для картинок в заметках.
+ * Ключ: notes-images/<userId>/<timestamp>-<random>-<safeName>
+ * Лимит размера на картинку: 10 MB (отдельный от DROP).
+ */
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+
+async function handlePresignImage(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const userId = await requireUserId(request, env, origin);
+
+  let body: { fileName?: string; size?: number; contentType?: string };
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'Invalid JSON body' }, { status: 400 }, origin);
+  }
+
+  const { fileName, size, contentType } = body;
+  if (!fileName || typeof size !== 'number' || !contentType) {
+    return json({ error: 'fileName, size, contentType required' }, { status: 400 }, origin);
+  }
+  if (!contentType.startsWith('image/')) {
+    return json({ error: 'Only image/* content-type allowed' }, { status: 400 }, origin);
+  }
+  if (size <= 0 || size > MAX_IMAGE_SIZE) {
+    return json(
+      { error: `Image too large. Max ${MAX_IMAGE_SIZE} bytes (10 MB)` },
+      { status: 413 },
+      origin
+    );
+  }
+
+  const usage = await calculateUsage(env, userId);
+  if (usage + size > MAX_STORAGE_BYTES) {
+    return json(
+      { error: 'Storage quota exceeded', used: usage, limit: MAX_STORAGE_BYTES, wouldAdd: size },
+      { status: 413 },
+      origin
+    );
+  }
+
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).slice(2, 10);
+  const safeName = sanitizeName(fileName);
+  const key = `notes-images/${userId}/${timestamp}-${random}-${safeName}`;
+
+  const aws = new AwsClient({
+    accessKeyId: env.R2_ACCESS_KEY_ID,
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+    service: 's3',
+    region: 'auto',
+  });
+
+  const r2Url = new URL(
+    `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/eving-files/${key}`
+  );
+  r2Url.searchParams.set('X-Amz-Expires', '900');
+
+  const signed = await aws.sign(
+    new Request(r2Url.toString(), {
+      method: 'PUT',
+      headers: { 'content-type': contentType },
+    }),
+    { aws: { signQuery: true } }
+  );
+
+  // URL для embed в markdown — через Worker proxy чтобы было постоянным
+  const publicUrl = `${new URL(request.url).origin}/img?key=${encodeURIComponent(key)}`;
+
+  return json(
+    { uploadUrl: signed.url, key, publicUrl },
+    {},
+    origin
+  );
+}
+
+/**
+ * GET /img?key=notes-images/<userId>/<filename>
+ * Public-доступный proxy для картинок в заметках.
+ * Stream'ит из R2, кеширует на 1 день в браузере.
+ * Защита от directory traversal — только notes-images/ префикс разрешён.
+ */
+async function handleImg(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const url = new URL(request.url);
+  const key = url.searchParams.get('key');
+  if (!key) return json({ error: 'key required' }, { status: 400 }, origin);
+
+  if (!key.startsWith('notes-images/') || key.includes('..') || key.includes('//')) {
+    return json({ error: 'Invalid key' }, { status: 400 }, origin);
+  }
+
+  const obj = await env.BUCKET.get(key);
+  if (!obj) return new Response('Not found', { status: 404 });
+
+  const headers = new Headers();
+  headers.set('content-type', obj.httpMetadata?.contentType ?? 'application/octet-stream');
+  headers.set('cache-control', 'public, max-age=86400, immutable');
+  headers.set('etag', obj.httpEtag);
+  // Открытый image — CORS не критичен (img tag не CORS-restricted by default)
+  // но если кому надо fetch — разрешим всем
+  headers.set('access-control-allow-origin', '*');
+
+  return new Response(obj.body, { headers });
 }
 
 async function handleUsage(request: Request, env: Env, origin: string | null): Promise<Response> {
@@ -327,6 +434,14 @@ export default {
 
       if (url.pathname === '/usage' && request.method === 'GET') {
         return await handleUsage(request, env, origin);
+      }
+
+      if (url.pathname === '/presign-image' && request.method === 'POST') {
+        return await handlePresignImage(request, env, origin);
+      }
+
+      if (url.pathname === '/img' && request.method === 'GET') {
+        return await handleImg(request, env, origin);
       }
 
       return json({ error: 'Not found' }, { status: 404 }, origin);
