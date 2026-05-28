@@ -328,15 +328,39 @@ async function handleList(request: Request, env: Env, origin: string | null): Pr
     limit: 1000,
   });
 
-  const files = listing.objects.map((o) => ({
-    key: o.key,
-    name: extractName(o.key),
-    size: o.size,
-    uploaded: o.uploaded.toISOString(),
-    contentType: o.httpMetadata?.contentType ?? 'application/octet-stream',
-  }));
+  // Подписываем preview-URL для image-объектов (1 час)
+  const aws = new AwsClient({
+    accessKeyId: env.R2_ACCESS_KEY_ID,
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+    service: 's3',
+    region: 'auto',
+  });
 
-  // Свежие первыми
+  const files = await Promise.all(
+    listing.objects.map(async (o) => {
+      const contentType = o.httpMetadata?.contentType ?? 'application/octet-stream';
+      const base = {
+        key: o.key,
+        name: extractName(o.key),
+        size: o.size,
+        uploaded: o.uploaded.toISOString(),
+        contentType,
+      };
+      if (contentType.startsWith('image/')) {
+        const url = new URL(
+          `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/eving-files/${o.key}`
+        );
+        url.searchParams.set('X-Amz-Expires', '3600');
+        const signed = await aws.sign(
+          new Request(url.toString(), { method: 'GET' }),
+          { aws: { signQuery: true } }
+        );
+        return { ...base, previewUrl: signed.url };
+      }
+      return base;
+    })
+  );
+
   files.sort((a, b) => (a.uploaded < b.uploaded ? 1 : -1));
 
   return json({ files, truncated: listing.truncated }, {}, origin);
