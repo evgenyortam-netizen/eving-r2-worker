@@ -208,6 +208,47 @@ async function handleDelete(request: Request, env: Env, origin: string | null): 
   return json({ ok: true, key }, {}, origin);
 }
 
+async function handleDownload(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const userId = await requireUserId(request, env, origin);
+  const url = new URL(request.url);
+  const key = url.searchParams.get('key');
+
+  if (!key) return json({ error: 'key query param required' }, { status: 400 }, origin);
+
+  const expectedPrefix = `drops/${userId}/`;
+  if (!key.startsWith(expectedPrefix)) {
+    return json({ error: 'Forbidden: not your file' }, { status: 403 }, origin);
+  }
+
+  const aws = new AwsClient({
+    accessKeyId: env.R2_ACCESS_KEY_ID,
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+    service: 's3',
+    region: 'auto',
+  });
+
+  const r2Url = new URL(
+    `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/eving-files/${key}`
+  );
+  // 5 минут жизни
+  r2Url.searchParams.set('X-Amz-Expires', '300');
+
+  const signed = await aws.sign(
+    new Request(r2Url.toString(), { method: 'GET' }),
+    { aws: { signQuery: true } }
+  );
+
+  return json(
+    {
+      downloadUrl: signed.url,
+      key,
+      expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    },
+    {},
+    origin
+  );
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const origin = request.headers.get('Origin');
@@ -234,6 +275,10 @@ export default {
 
       if (url.pathname === '/file' && request.method === 'DELETE') {
         return await handleDelete(request, env, origin);
+      }
+
+      if (url.pathname === '/download' && request.method === 'GET') {
+        return await handleDownload(request, env, origin);
       }
 
       return json({ error: 'Not found' }, { status: 404 }, origin);
