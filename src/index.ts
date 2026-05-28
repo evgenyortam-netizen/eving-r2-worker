@@ -25,8 +25,9 @@ interface Env {
   SUPABASE_PROJECT_URL: string;
 }
 
-// FREE tier лимит на размер файла = 250 MB
-const MAX_FILE_SIZE = 250 * 1024 * 1024;
+// FREE tier лимиты
+const MAX_FILE_SIZE = 250 * 1024 * 1024; // 250 MB на файл
+const MAX_STORAGE_BYTES = 1 * 1024 * 1024 * 1024; // 1 GB total
 
 // Разрешённые origins для CORS
 const ALLOWED_ORIGINS = [
@@ -109,6 +110,33 @@ function extractName(key: string): string {
   return m ? m[1] : base;
 }
 
+/**
+ * Считает общий объём storage пользователя суммируя все размеры в `drops/<userId>/`.
+ * Хождение в R2 list — стоит копейки, но кэшировать стоило бы для high-traffic.
+ */
+async function calculateUsage(env: Env, userId: string): Promise<number> {
+  const prefix = `drops/${userId}/`;
+  let total = 0;
+  let cursor: string | undefined;
+  // Пагинация на случай >1000 файлов
+  do {
+    const listing: R2Objects = await env.BUCKET.list({ prefix, limit: 1000, cursor });
+    for (const obj of listing.objects) total += obj.size;
+    cursor = listing.truncated ? listing.cursor : undefined;
+  } while (cursor);
+  return total;
+}
+
+async function handleUsage(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const userId = await requireUserId(request, env, origin);
+  const used = await calculateUsage(env, userId);
+  return json(
+    { used, limit: MAX_STORAGE_BYTES, fileSizeLimit: MAX_FILE_SIZE },
+    {},
+    origin
+  );
+}
+
 async function handlePresign(request: Request, env: Env, origin: string | null): Promise<Response> {
   const userId = await requireUserId(request, env, origin);
 
@@ -126,6 +154,22 @@ async function handlePresign(request: Request, env: Env, origin: string | null):
   if (size <= 0 || size > MAX_FILE_SIZE) {
     return json(
       { error: `File too large. Max ${MAX_FILE_SIZE} bytes (250 MB)` },
+      { status: 413 },
+      origin
+    );
+  }
+
+  // Storage quota check (1 GB FREE tier)
+  const usage = await calculateUsage(env, userId);
+  if (usage + size > MAX_STORAGE_BYTES) {
+    return json(
+      {
+        error: 'Storage quota exceeded',
+        detail: `Used ${usage} of ${MAX_STORAGE_BYTES} bytes. Adding ${size} bytes would exceed limit.`,
+        used: usage,
+        limit: MAX_STORAGE_BYTES,
+        wouldAdd: size,
+      },
       { status: 413 },
       origin
     );
@@ -279,6 +323,10 @@ export default {
 
       if (url.pathname === '/download' && request.method === 'GET') {
         return await handleDownload(request, env, origin);
+      }
+
+      if (url.pathname === '/usage' && request.method === 'GET') {
+        return await handleUsage(request, env, origin);
       }
 
       return json({ error: 'Not found' }, { status: 404 }, origin);
